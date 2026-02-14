@@ -1,103 +1,379 @@
-import os, re, sys, zipfile, platform, subprocess, requests, hashlib
+#!/usr/bin/env python3
+import os, re, sys, zipfile, platform, subprocess, requests, hashlib, base64, shutil, time
 from datetime import datetime
 
 GITHUB_RAW_SELF = "https://raw.githubusercontent.com/realalexde/vibezip/main/vz.py"
-auto_yes = False
-args = sys.argv[1:]
+TIMEOUT = 10
 
-if "-y" in args: auto_yes = True
-if "-u" in args:
-    try:
-        r = requests.get(GITHUB_RAW_SELF, timeout=10)
-        r.raise_for_status()
-        remote_hash = hashlib.sha256(r.content).hexdigest()
-        with open(__file__,"rb") as f: local_hash=hashlib.sha256(f.read()).hexdigest()
-        if local_hash != remote_hash:
-            with open(__file__,"wb") as f: f.write(r.content)
-            print("vz.py updated successfully! Please rerun.")
-        else: print("vz.py is already up-to-date.")
-    except Exception as e:
-        print(f"Update failed: {e}")
-    sys.exit(0)
+def fetch_text(url):
+    r = requests.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.text
 
-if len(args)<1: sys.exit("Usage: py vz.py <project_txt_or_url> [-f|-z] [-y]")
+def fetch_bytes(url):
+    r = requests.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.content
 
-project_input = args[0]
-flag = None
-for a in args[1:]:
-    if a in ("-f","-z"): flag=a
+def sha256_bytes(b):
+    return hashlib.sha256(b).hexdigest()
 
-mode = "FOLDER" if flag in (None,"-f") else "ZIP"
+def parse_content(raw):
+    lines = raw.splitlines()
+    no_comments = [ln for ln in lines if not ln.strip().startswith("#")]
+    text = "\n".join(no_comments)
+    version_m = re.search(r'^vibezip\s+v([^\s]+)', text, re.MULTILINE)
+    project_version = version_m.group(1) if version_m else None
+    project_m = re.search(r'MAKE\s+"(.+?)"', text)
+    project_name = project_m.group(1) if project_m else None
+    update_m = re.search(r'update_link\(\s*(.*?)\s*\)', text)
+    update_link = update_m.group(1).strip() if update_m else None
+    # extract and remove commands blocks (they are after files but could be anywhere)
+    commands = {}
+    for key in ("commandsWIN", "commandsMAC", "commandsLINUX"):
+        m = re.search(rf'{key}\(\n(.*?)\n\)', text, re.DOTALL)
+        if m:
+            commands[key] = m.group(1).strip()
+            text = text.replace(m.group(0), "")
+    # Now extract file entries: supports (content), DOWNLOAD(url), BASE64(content)
+    pattern = re.compile(r'([^\s\(\n]+)\s*(?:\(\n(.*?)\n\)|DOWNLOAD\((.*?)\)|BASE64\(\n(.*?)\n\))', re.DOTALL)
+    files = []
+    for m in pattern.finditer(text):
+        path = m.group(1).strip()
+        plain = m.group(2)
+        download_url = m.group(3)
+        b64 = m.group(4)
+        entry = {"path": path}
+        if plain is not None and plain != "":
+            entry["type"] = "text"
+            entry["data"] = plain
+        elif download_url:
+            entry["type"] = "download"
+            entry["url"] = download_url.strip()
+        elif b64 is not None:
+            entry["type"] = "base64"
+            entry["data_b64"] = b64.strip()
+        else:
+            entry["type"] = "empty"
+            entry["data"] = ""
+        files.append(entry)
+    return {
+        "project_name": project_name,
+        "project_version": project_version,
+        "update_link": update_link,
+        "commands": commands,
+        "files": files,
+        "raw_nocomment": text
+    }
 
-if project_input.startswith("http"):
-    try: r=requests.get(project_input, timeout=10); r.raise_for_status(); content=r.text
-    except Exception as e: sys.exit(f"Failed to download {project_input}: {e}")
-else:
-    with open(project_input,"r",encoding="utf-8") as f: content=f.read()
+def compare_versions(a, b):
+    if a is None or b is None: return None
+    def to_tuple(x):
+        parts = x.split(".")
+        nums = []
+        for p in parts:
+            try: nums.append(int(p))
+            except: nums.append(0)
+        return tuple(nums)
+    ta, tb = to_tuple(a), to_tuple(b)
+    L = max(len(ta), len(tb))
+    ta = ta + (0,)*(L - len(ta))
+    tb = tb + (0,)*(L - len(tb))
+    if ta < tb: return -1
+    if ta > tb: return 1
+    return 0
 
-content_lines=[l for l in content.splitlines() if not l.strip().startswith("#")]
-content="\n".join(content_lines)
+def ensure_dir_for_file(path):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
-version_match = re.search(r'^vibezip\s+v[0-9.]+',content,re.M)
-if not version_match: sys.exit("Invalid vibezip header")
-version_line = version_match.group(0)
+def backup_file(path):
+    if not os.path.exists(path):
+        return None
+    ts = time.strftime("%Y%m%d%H%M%S")
+    bak = f"{path}.bak.{ts}"
+    shutil.copy2(path, bak)
+    return bak
 
-project_match = re.search(r'MAKE\s+"(.+?)"',content)
-if not project_match: sys.exit("Project name not found")
-project_name = project_match.group(1)
-
-commands_blocks={}
-for cmd_type in ["commandsWIN","commandsMAC","commandsLINUX"]:
-    m=re.search(rf'{cmd_type}\(\n(.*?)\n\)',content,re.DOTALL)
-    if m:
-        commands_blocks[cmd_type]=m.group(1).strip()
-        content=content.replace(m.group(0),"")
-
-file_pattern = re.compile(r'([^\s\(\n]+)\s*(?:\(\n(.*?)\n\)|DOWNLOAD\((.*?)\))', re.DOTALL)
-files=file_pattern.findall(content)
-
-def write_file(path,data):
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-    with open(path,"w",encoding="utf-8") as f: f.write(data)
-
-def handle_commands(commands,script_path,is_windows=False):
-    with open(script_path,"w",encoding="utf-8") as f_script:
-        if not is_windows: f_script.write("#!/bin/bash\n\n")
-        for line in commands.splitlines():
-            ans = "y" if auto_yes else input(f"Execute '{line}' now? (y/n): ").strip().lower()
-            if ans=="y": subprocess.run(line,shell=True)
-            else: f_script.write(line+"\n")
-    if not is_windows: os.chmod(script_path,0o755)
-
-if mode=="FOLDER":
-    os.makedirs(project_name,exist_ok=True)
-    for path,fc,url in files:
-        full=os.path.join(project_name,path.replace("/","\\"))
-        if url: r=requests.get(url,timeout=10); r.raise_for_status(); data=r.text
-        else: data=fc
-        write_file(full,data)
-
+def write_project_folder(parsed, auto_yes=False, backup=False):
+    pname = parsed["project_name"]
+    pversion = parsed["project_version"]
+    update_link = parsed["update_link"]
+    files = parsed["files"]
+    commands = parsed["commands"]
+    os.makedirs(pname, exist_ok=True)
+    for entry in files:
+        rel = entry["path"].replace("/", os.sep)
+        full = os.path.join(pname, rel)
+        ensure_dir_for_file(full)
+        if backup and os.path.exists(full):
+            backup_file(full)
+        if entry["type"] == "text":
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(entry.get("data",""))
+        elif entry["type"] == "download":
+            data = fetch_bytes(entry["url"])
+            # try decode as text, else write as bytes
+            try:
+                text = data.decode("utf-8")
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except:
+                with open(full, "wb") as f:
+                    f.write(data)
+        elif entry["type"] == "base64":
+            b = base64.b64decode(entry["data_b64"])
+            with open(full, "wb") as f:
+                f.write(b)
+        else:
+            open(full, "a").close()
+    # install scripts per platform
     sys_type = platform.system()
-    if sys_type=="Windows": cmds=commands_blocks.get("commandsWIN","")
-    else: cmds=commands_blocks.get("commandsLINUX" if sys_type=="Linux" else "commandsMAC","")
-    if cmds:
-        handle_commands(cmds, os.path.join(project_name,"install.bat" if sys_type=="Windows" else "install.sh"), sys_type=="Windows")
+    if sys_type == "Windows":
+        cmds = commands.get("commandsWIN","")
+        script_path = os.path.join(pname, "install.bat")
+        if cmds:
+            with open(script_path, "w", encoding="utf-8") as sc:
+                sc.write("@echo off\n")
+                for line in cmds.splitlines():
+                    line = line.strip()
+                    if not line: continue
+                    if auto_yes:
+                        sc.write(f"{line}\n")
+                        try: subprocess.run(line, shell=True)
+                        except: pass
+                    else:
+                        ans = input(f"Execute '{line}' now? (y/n): ").strip().lower()
+                        if ans == "y":
+                            try: subprocess.run(line, shell=True)
+                            except: pass
+                        else:
+                            sc.write(f"{line}\n")
+    else:
+        key = "commandsLINUX" if sys_type=="Linux" else "commandsMAC"
+        cmds = commands.get(key,"")
+        script_path = os.path.join(pname, "install.sh")
+        if cmds:
+            with open(script_path, "w", encoding="utf-8") as sc:
+                sc.write("#!/bin/bash\n\n")
+                for line in cmds.splitlines():
+                    line = line.strip()
+                    if not line: continue
+                    if auto_yes:
+                        sc.write(f"{line}\n")
+                        try: subprocess.run(line, shell=True)
+                        except: pass
+                    else:
+                        ans = input(f"Execute '{line}' now? (y/n): ").strip().lower()
+                        if ans == "y":
+                            try: subprocess.run(line, shell=True)
+                            except: pass
+                        else:
+                            sc.write(f"{line}\n")
+            try: os.chmod(script_path, 0o755)
+    # write vibezip metadata inside project folder
+    meta_path = os.path.join(pname, "vibezip")
+    meta = []
+    meta.append(f"project:{pname}")
+    if pversion: meta.append(f"project_version:{pversion}")
+    meta.append(f"mode:FOLDER")
+    meta.append(f"files_count:{len(files)}")
+    if update_link: meta.append(f"update_link:{update_link}")
+    meta.append(f"created_at:{datetime.now().isoformat()}")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(meta))
+    return pname
 
-    with open(os.path.join(project_name,"vibezip"),"w",encoding="utf-8") as f:
-        f.write(f"version:{version_line}\nproject:{project_name}\nmode:{mode}\nfiles_count:{len(files)}\ncommands:{', '.join(commands_blocks.keys())}\ncreated_at:{datetime.now().isoformat()}\n")
-    print(f"Project folder '{project_name}' created.")
+def write_project_zip(parsed, auto_yes=False, backup=False):
+    pname = parsed["project_name"]
+    pversion = parsed["project_version"]
+    update_link = parsed["update_link"]
+    files = parsed["files"]
+    commands = parsed["commands"]
+    zname = f"{pname}.zip"
+    with zipfile.ZipFile(zname, "w") as zf:
+        for entry in files:
+            path = entry["path"]
+            if entry["type"] == "text":
+                zf.writestr(path, entry.get("data",""))
+            elif entry["type"] == "download":
+                data = fetch_bytes(entry["url"])
+                zf.writestr(path, data)
+            elif entry["type"] == "base64":
+                b = base64.b64decode(entry["data_b64"])
+                zf.writestr(path, b)
+            else:
+                zf.writestr(path, "")
+        # commands: include install scripts (not executed for zip creation)
+        win_cmds = commands.get("commandsWIN","")
+        other_cmds = "\n".join(commands.get("commandsLINUX","").splitlines() + commands.get("commandsMAC","").splitlines())
+        if win_cmds:
+            bat = "@echo off\n" + "\n".join([ln for ln in win_cmds.splitlines() if ln.strip()])
+            zf.writestr("install.bat", bat)
+        if other_cmds:
+            sh = "#!/bin/bash\n\n" + "\n".join([f'echo "Running: {ln}"\n{ln}' for ln in other_cmds.splitlines() if ln.strip()])
+            zf.writestr("install.sh", sh)
+        # vibezip metadata inside zip
+        meta = []
+        meta.append(f"project:{pname}")
+        if pversion: meta.append(f"project_version:{pversion}")
+        meta.append("mode:ZIP")
+        meta.append(f"files_count:{len(files)}")
+        if update_link: meta.append(f"update_link:{update_link}")
+        meta.append(f"created_at:{datetime.now().isoformat()}")
+        zf.writestr("vibezip", "\n".join(meta))
+    return zname
 
-elif mode=="ZIP":
-    zipf = zipfile.ZipFile(f"{project_name}.zip","w")
-    for path,fc,url in files:
-        if url: r=requests.get(url,timeout=10); r.raise_for_status(); data=r.text
-        else: data=fc
-        zipf.writestr(path,data)
+def process_project_text(raw_text, mode="FOLDER", auto_yes=False, backup=False):
+    parsed = parse_content(raw_text)
+    if not parsed["project_name"]:
+        raise RuntimeError("Project name not found in content")
+    if mode == "FOLDER":
+        return write_project_folder(parsed, auto_yes=auto_yes, backup=backup)
+    else:
+        return write_project_zip(parsed, auto_yes=auto_yes, backup=backup)
 
-    for cmd_type,cmds in commands_blocks.items():
-        if cmd_type=="commandsWIN": zipf.writestr("install.bat","\n".join([f"@echo off\necho Running: {line}" for line in cmds.splitlines()]))
-        else: zipf.writestr("install.sh","#/bin/bash\n"+ "\n".join([f'echo "Running: {line}"' for line in cmds.splitlines()]))
+def self_update(auto_yes=False):
+    try:
+        remote = fetch_bytes(GITHUB_RAW_SELF)
+        remote_hash = sha256_bytes(remote)
+        with open(__file__,"rb") as f:
+            local = f.read()
+        local_hash = sha256_bytes(local)
+        if local_hash != remote_hash:
+            print("New vz.py is available on GitHub.")
+            if auto_yes:
+                ans = "y"
+            else:
+                ans = input("Install update to vz.py now? [y/n]: ").strip().lower()
+            if ans == "y":
+                bak = __file__ + ".bak." + time.strftime("%Y%m%d%H%M%S")
+                try: shutil.copy2(__file__, bak)
+                except: pass
+                with open(__file__,"wb") as f:
+                    f.write(remote)
+                print("vz.py updated. Please rerun the script.")
+                return True
+            else:
+                print("Update skipped.")
+                return False
+        else:
+            print("vz.py is up-to-date.")
+            return False
+    except Exception as e:
+        print("Self-update failed:", e)
+        return False
 
-    meta = (f"version:{version_line}\nproject:{project_name}\nmode:{mode}\nfiles_count:{len(files)}\ncommands:{', '.join(commands_blocks.keys())}\ncreated_at:{datetime.now().isoformat()}\n")
-    zipf.writestr("vibezip",meta); zipf.close()
-    print(f"Archive '{project_name}.zip' created with install scripts.")
+def check_project_update_current_folder(auto_yes=False, backup=False):
+    vibep = os.path.join(os.getcwd(), "vibezip")
+    if not os.path.exists(vibep):
+        print("vibezip metadata not found in current folder.")
+        return
+    with open(vibep,"r",encoding="utf-8") as f:
+        meta = f.read()
+    m_link = re.search(r'update_link:(.+)', meta)
+    m_ver = re.search(r'project_version:(.+)', meta)
+    m_mode = re.search(r'mode:(.+)', meta)
+    link = m_link.group(1).strip() if m_link else None
+    local_ver = m_ver.group(1).strip() if m_ver else None
+    mode = m_mode.group(1).strip() if m_mode else "FOLDER"
+    if not link:
+        print("No update_link in vibezip.")
+        return
+    try:
+        remote_text = fetch_text(link)
+    except Exception as e:
+        print("Failed to fetch update:", e)
+        return
+    parsed_remote = parse_content(remote_text)
+    remote_ver = parsed_remote.get("project_version")
+    if remote_ver is None:
+        print("Remote project has no version header.")
+        return
+    cmp = compare_versions(local_ver, remote_ver)
+    if cmp is None:
+        print("Cannot compare versions.")
+        return
+    if cmp >= 0:
+        print("Project is up-to-date.")
+        return
+    print(f"New project version available: {remote_ver}")
+    print(f"Current version: {local_ver}")
+    if auto_yes:
+        ans = "y"
+    else:
+        ans = input("Install update? [y/n]: ").strip().lower()
+    if ans == "y":
+        # perform update: overwrite files according to mode in vibezip metadata (use remote parsed content)
+        if backup:
+            # backup current files by copying project folder to .backup.timestamp
+            folder = os.getcwd()
+            bname = f"{folder}.backup.{time.strftime('%Y%m%d%H%M%S')}"
+            shutil.copytree(folder, bname)
+            print(f"Backup created: {bname}")
+        # write project according to mode
+        if mode.upper() == "ZIP":
+            write_project_zip(parsed_remote, auto_yes=auto_yes, backup=backup)
+            print("Project ZIP updated.")
+        else:
+            write_project_folder(parsed_remote, auto_yes=auto_yes, backup=backup)
+            print("Project folder updated.")
+    else:
+        print("Update cancelled.")
+
+def usage_and_exit():
+    print("Usage:")
+    print("  py vz.py <project_txt_or_url>          # create project folder (default)")
+    print("  py vz.py <project_txt_or_url> -z       # create ZIP instead")
+    print("  py vz.py <project_txt_or_url> -f       # explicit folder")
+    print("  py vz.py -u                            # self update vz.py from GitHub")
+    print("  py vz.py -c                            # check update for project in current folder")
+    print("Optional flags: -y  (auto yes), -b (backup before overwrite)")
+    sys.exit(1)
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        usage_and_exit()
+    auto_yes = "-y" in args
+    backup = "-b" in args
+    if "-u" in args:
+        self_update(auto_yes=auto_yes)
+        return
+    if "-c" in args:
+        check_project_update_current_folder(auto_yes=auto_yes, backup=backup)
+        return
+    # process create/update from given input
+    # first arg should be project_txt_or_url
+    src = args[0]
+    flag = None
+    for a in args[1:]:
+        if a in ("-z","-f"):
+            flag = a
+    # default behavior: folder (same as no flag)
+    mode = "ZIP" if flag == "-z" else "FOLDER"
+    # read content
+    try:
+        if src.startswith("http://") or src.startswith("https://"):
+            raw = fetch_text(src)
+        else:
+            with open(src,"r",encoding="utf-8") as f:
+                raw = f.read()
+    except Exception as e:
+        print("Failed to read project source:", e)
+        return
+    try:
+        result = process_project_text(raw, mode=mode, auto_yes=auto_yes, backup=backup)
+        if mode == "FOLDER":
+            print(f"Project folder '{result}' created/updated.")
+        else:
+            print(f"Project archive '{result}' created.")
+        # if update_link present -> write vibezip inside project (already done), ensure included
+        parsed = parse_content(raw)
+        # if project created as folder and update_link exists, it's already in vibezip metadata
+    except Exception as e:
+        print("Error processing project:", e)
+
+if __name__ == "__main__":
+    main()
