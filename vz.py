@@ -5,6 +5,7 @@ from datetime import datetime
 GITHUB_RAW_SELF = "https://raw.githubusercontent.com/realalexde/vibezip/main/vz.py"
 TIMEOUT = 10
 
+# --- базовые утилиты ---
 def fetch_text(url):
     r = requests.get(url, timeout=TIMEOUT)
     r.raise_for_status()
@@ -18,6 +19,7 @@ def fetch_bytes(url):
 def sha256_bytes(b):
     return hashlib.sha256(b).hexdigest()
 
+# --- разбор zip.txt ---
 def parse_content(raw):
     lines = raw.splitlines()
     no_comments = [ln for ln in lines if not ln.strip().startswith("#")]
@@ -64,6 +66,7 @@ def parse_content(raw):
         "raw_nocomment": text
     }
 
+# --- сравнение версий ---
 def compare_versions(a, b):
     if a is None or b is None: return None
     def to_tuple(x):
@@ -81,6 +84,7 @@ def compare_versions(a, b):
     if ta > tb: return 1
     return 0
 
+# --- вспомогательные ---
 def ensure_dir_for_file(path):
     d = os.path.dirname(path)
     if d:
@@ -97,6 +101,7 @@ def backup_file(path):
         pass
     return bak
 
+# --- создание проекта в папке ---
 def write_project_folder(parsed, auto_yes=False, backup=False):
     pname = parsed["project_name"]
     pversion = parsed["project_version"]
@@ -131,6 +136,7 @@ def write_project_folder(parsed, auto_yes=False, backup=False):
                 open(full, "a").close()
         except:
             pass
+    # команды
     sys_type = platform.system()
     if sys_type == "Windows":
         cmds = commands.get("commandsWIN","")
@@ -195,13 +201,3 @@ def write_project_folder(parsed, auto_yes=False, backup=False):
     meta.append(f"created_at:{datetime.now().isoformat()}")
     try:
         with open(meta_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(meta))
-    except:
-        pass
-    return pname
-
-# Остальные функции (write_project_zip, process_project_text, self_update, check_project_update_current_folder, usage_and_exit, main) аналогично с добавленными try/except везде.
-# Для краткости здесь я оставил основной пример с исправленными try/except.
-
-if __name__ == "__main__":
-    main()
